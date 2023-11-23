@@ -1,7 +1,9 @@
 use std::env;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::io::net::TcpListener;
-use  tokio::io::process::Command;
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio_util::codec::{Framed,LengthDelimitedCodec};
 
 /**
  *  1、在linux下有些命令这样使用ls -a（参数前一横）；
@@ -28,36 +30,25 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
     // 无条件循环，表名自己始终处于服务状态
     loop {
         // waiting client connect
-        let (mut socket,_) = listener.accept().await?;
+        let (stream,_) = listener.accept().await?;
+        // 包裹成 frame_steam
+        let mut framed_stream = Framed::new(stream,LengthDelimitedCodec::new());
 
         // create a new task when client connect comming
         tokio::spawn( async move {
-            // 分配缓冲区
-            let mut buf = [0;1024];
-            let mut offset = 0;
-            // 循环读取，不能确保一次能从网络读完全部数据
-            // 正常情况下，读到数据就会返回，没有读到就会等待
-            loop {
-                let n = socket.read(&mut buf[offset..])
-                .await
-                .except("failed to read data from socket");
-                // n 返回0的情况是碰到了 EOF，表明远端的写操作已经断开，这个要判断
-                if n == 0 {
-                    // eof end task
-                    return;
-                }
-                print!("offset: {offset}, n:{n}");    
-                let end = offset + n;
+            while let Some(msg) = framed_stream.next().await {
+                match msg {
+                    Ok(msg) => {
+                        let directive = String::from_utf8(msg.to_vec())
+                        .expect("error when converting to string directive.");
+                        print!("{directive}");
+                        let output = process(&directive).await;
+                        _ = framed_stream.send(Bytes::from(output)).await;
 
-                if let Ok(directive) = std::str::from_utf8(&buf[..end]){
-                    println!("{}", directive);
-                    let output = process(directive).await;
-                    println!("{output}");
-                    socket.wtire_all(&output.as_bytes()).await
-                    .except("failed to write data to socket");
-                } else {
-                    // 判断是否转换失败，如果是可能网络数据没有读取完成，要继续loop 然后读取
-                    offset = end;
+                    }
+                    Err(e) => {
+                        print!("{e:?}")
+                    }
                 }
             }
         });
@@ -66,7 +57,7 @@ async fn main() -> Result<(),Box<dyn std::error::Error>> {
 
 async fn process(directive: &str) -> String {
     if directive == "gettime" {
-        let output = Command::new("date").output().await.unwarp();
+        let output = Command::new("date").output().await.unwrap();
         String::from_utf8(output.stdout).unwrap()
     } else {
         // 如果是其他指令返回无效
